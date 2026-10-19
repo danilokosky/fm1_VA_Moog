@@ -1,13 +1,22 @@
 /* SPDX-License-Identifier: GPL-3.0-only WITH GPL-3.0-linking-exception */
+
 #include "audio_output.h"
 #include "fm1_engine_control.h"
 #include "fm1_audio_io.h"
+
+// 1. INCLUSÃO DO MOTOR MOOG EM C PURO
+#include "synth/moog_engine.h"
+
+// Instância global do sintetizador
+static MoogEngine moog_synth;
+static int moog_initialized = 0;
 
 static unsigned output_gain;
 static int32_t usb_pcm[FM1_BLOCK_WORDS] __attribute__((aligned(32)));
 static int16_t bluetooth_pcm[FM1_BLOCK_WORDS] __attribute__((aligned(32)));
 
 void fm1_output_reset(void) { output_gain = 0; }
+
 static inline __attribute__((always_inline)) int32_t limit(int64_t value)
 {
     /* Bias signed 24-bit PCM into [0, 2^24). Unsigned arithmetic also
@@ -16,9 +25,27 @@ static inline __attribute__((always_inline)) int32_t limit(int64_t value)
         return value < 0 ? -8388608 : 8388607;
     return (int32_t)value;
 }
+
 FM1_AUDIO_CODE void fm1_output_mix(int32_t *output)
 {
     if (!output) return;
+
+    // 2. INICIALIZAÇÃO DO MOOG (Roda apenas na primeira vez)
+    if (!moog_initialized) {
+        moog_init(&moog_synth, 44100.0f);
+        moog_initialized = 1;
+    }
+
+    // 3. GERAÇÃO E CONVERSÃO DO ÁUDIO DO MOOG
+    float float_buffer[FM1_BLOCK_WORDS];
+    moog_process_buffer(&moog_synth, float_buffer, FM1_BLOCK_WORDS);
+
+    for (unsigned i = 0; i < FM1_BLOCK_WORDS; ++i) {
+        // Converte o float (-1.0 a +1.0) para 24-bit PCM int32
+        output[i] = (int32_t)(float_buffer[i] * 8388607.0f);
+    }
+
+    // 4. CÓDIGO ORIGINAL M-VAVE (Controle de volume, USB e Bluetooth)
     unsigned target = fm1_engine_output_level();
     if (target > 127U) target = 127U;
     int delta = (int)target - (int)output_gain;
@@ -28,6 +55,7 @@ FM1_AUDIO_CODE void fm1_output_mix(int32_t *output)
     int usb_frames = fm1_usb_audio_read(usb_pcm, FM1_BLOCK_FRAMES, usb_gain);
     unsigned left = ((unsigned)usb_gain[0] * output_gain) >> 7;
     unsigned right = ((unsigned)usb_gain[1] * output_gain) >> 7;
+
     /* Accumulate USB before clipping, then add Bluetooth.
      * Discard the block if the USB stream resets. */
     for (unsigned i = 0; i < FM1_BLOCK_WORDS; ++i) {
@@ -36,6 +64,7 @@ FM1_AUDIO_CODE void fm1_output_mix(int32_t *output)
             value += ((int64_t)usb_pcm[i] * ((i & 1U) ? right : left)) >> 7;
         output[i] = usb_frames == -2 ? 0 : limit(value);
     }
+
     if (fm1_bluetooth_audio_read(bluetooth_pcm, FM1_BLOCK_FRAMES) == FM1_BLOCK_FRAMES) {
         /* output is already clipped to 24 bits. Adding signed 16-bit PCM
          * times at most 254 fits in 25 bits, so this stage needs no int64. */
@@ -44,5 +73,6 @@ FM1_AUDIO_CODE void fm1_output_mix(int32_t *output)
             output[i] = value > 8388607 ? 8388607 : value < -8388608 ? -8388608 : value;
         }
     }
+
     (void)fm1_usb_audio_write(output, FM1_BLOCK_FRAMES);
 }
